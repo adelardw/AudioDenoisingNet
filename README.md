@@ -25,6 +25,8 @@ Evaluated on **VoiceBank + DEMAND** and **LibriSpeech + WHAM!**.
 | PESQ-NB | 2.699 | 2.426 |
 | PESQ-WB | 1.876 | 1.784 |
 
+> These are the thesis numbers, measured with the original inference path. It has an edge artifact that lowers every metric; with the fix, the same checkpoint reaches SI-SDR 9.54 dB, PESQ-WB 2.014, PESQ-NB 2.907 and STOI 0.913 on VoiceBank + DEMAND (see [Edge-artifact fix](#edge-artifact-fix)).
+
 Inference speed (single audio clip, Nvidia Tesla T4, VoiceBank + DEMAND):
 
 | Model | Params | Time |
@@ -37,6 +39,35 @@ Inference speed (single audio clip, Nvidia Tesla T4, VoiceBank + DEMAND):
 
 Quality is below transformer/Mamba SOTA models (e.g. TF-Locoformer reaches SI-SDR > 15 dB), but this model is the fastest on GPU in the comparison above, which is the trade-off it is built for. The STFT/ISTFT and padding/reshape steps run on CPU and dominate the CPU-side latency.
 
+## Edge-artifact fix
+
+The STFT uses `n_fft=2046`, `win_length=256`, `hop_length=123` and `center=False`, so the 256-sample window covers only the middle of each 2046-sample frame. The first and last ~900 samples (~56 ms) of every processed chunk are never covered by a window, and at the coverage boundary the inverse STFT divides by a near-zero window envelope. With `model.run`, the first ~56 ms of every output are zeroed and followed by a loud click at 0.056 s. Audio longer than 8 s is processed as independent 8 s chunks, so this repeats every 8 s.
+
+`utils/edge_fix.py` fixes this at inference time, with no retraining: `run_fixed` reflect-pads the input by 2048 samples, runs the network once on a length the U-Net accepts (STFT frame counts of the form `256 * j + 1`) and trims the padding. For clips up to ~7.7 s the network sees the same 8 s window as before, so the cost does not change.
+
+Full VoiceBank + DEMAND test set (824 clips, 16 kHz), checkpoint `ckpts/ultra/checkpoints/last.ckpt`:
+
+| | SI-SDR, dB | PESQ-WB | PESQ-NB | STOI |
+|---|---|---|---|---|
+| Noisy input (no processing) | 8.45 | 1.971 | 2.880 | 0.921 |
+| Original inference (`model.run`) | 5.20 | 1.876 | 2.699 | 0.902 |
+| **Fixed inference (`run_fixed`)** | **9.54** | **2.014** | **2.907** | **0.913** |
+
+Paired differences over the same 824 clips (mean ± 95% CI):
+
+| | SI-SDR, dB | PESQ-WB | PESQ-NB | STOI |
+|---|---|---|---|---|
+| Fixed vs. original inference | +4.34 ± 0.30 | +0.139 ± 0.017 | +0.208 ± 0.025 | +0.011 ± 0.001 |
+| Fixed vs. noisy input | +1.10 ± 0.14 | +0.044 ± 0.022 | +0.027 ± 0.015 | -0.008 ± 0.001 |
+
+The original-inference row reproduces the thesis numbers exactly; because of the artifact it is below the unprocessed input on every metric. With the fix, the model improves on the noisy input in SI-SDR and PESQ, while STOI stays slightly below it. LibriSpeech + WHAM! has not been re-evaluated yet.
+
+To reproduce (the test split is downloaded from the Hugging Face Hub):
+
+```bash
+python benchmarks/eval_vbd_edge_fix.py --ckpt ckpts/ultra/checkpoints/last.ckpt --out vbd_edge_fix.csv
+```
+
 ## Repository structure
 
 ```
@@ -44,7 +75,8 @@ AudioDenoisingNet/
 ├── configs/             # YAML model/training configs (e.g. denoise_model_v1_cfg.yaml)
 ├── lightning_modules/   # PyTorch Lightning modules (model + train/val/test steps)
 ├── loaders/             # Dataset and DataLoader construction (get_loaders)
-├── utils/               # Helpers, incl. config loader (cfg_loader.load_cfg)
+├── utils/               # Helpers, incl. config loader (cfg_loader.load_cfg) and edge_fix.run_fixed
+├── benchmarks/          # VoiceBank + DEMAND evaluation of the inference edge-artifact fix
 ├── onnx_converts/       # ONNX export scripts
 ├── examples/            # Example audio / usage
 ├── ckpts/               # Checkpoints
@@ -117,20 +149,18 @@ trainer.fit(model, train_loader, val_loader)
 ### Inference / denoising a file
 
 ```python
-import torch, torchaudio
-from lightning_modules.lightning_module import *
-from utils import cfg_loader
+import torchaudio
+from lightning_modules.lightning_module import UltraSpectrogramLightningModelUnet
+from utils.edge_fix import run_fixed
 
-ckpt_path = 'configs/last.ckpt'
-cfg_path = 'configs/denoise_model_v1_cfg.yaml'
+model = UltraSpectrogramLightningModelUnet.load_from_checkpoint(
+    'ckpts/ultra/checkpoints/last.ckpt', map_location='cpu'
+).eval()
 
-model = SpectrogramLightningModelUnet.load_from_checkpoint(
-    ckpt_path, **cfg_loader.load_cfg(cfg_path)
-)
-
-audio, rate = torchaudio.load('example.wav')
-denoised = model.run(audio)[0]
-torchaudio.save('denoised_example.wav', torch.tensor(denoised), rate)
+audio, rate = torchaudio.load('examples/example.wav')       # (channels, samples)
+audio = torchaudio.functional.resample(audio, rate, 16000)  # the model works at 16 kHz
+denoised = run_fixed(model, audio.mean(0))                  # mono in, same length out
+torchaudio.save('denoised_example.wav', denoised.unsqueeze(0), 16000)
 ```
 
 Or just run the provided script:
@@ -139,7 +169,7 @@ Or just run the provided script:
 python eval.py
 ```
 
-For long audio, segments equal in length to the training clips can be batched and processed in parallel, then stitched back together.
+`run_fixed` processes a clip of any length in one pass. Calling `model.run(audio)` directly still works, but it leaves the edge artifact described in [Edge-artifact fix](#edge-artifact-fix), and on audio longer than 8 s the artifact repeats every 8 s.
 
 ## Training configuration
 
